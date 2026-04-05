@@ -7,32 +7,19 @@ app = Flask(__name__)
 
 OPENWEATHER_API_KEY = os.environ.get("WEATHER_API_KEY")
 
-def get_weather_info(city, date_str=None):
-    # 後台日誌：記錄開始查詢
-    print(f">>> [LOG] 開始查詢城市: {city}") 
+def get_weather_info(city_name):
+    # --- 1. 地名標準化 (處理「臺/台」與贅字) ---
+    clean_city = city_name.replace("臺", "台")
+    for suffix in ["市", "縣", "區", "鄉", "鎮"]:
+        if clean_city.endswith(suffix):
+            clean_city = clean_city[:-1]
 
-    if not OPENWEATHER_API_KEY:
-        print(">>> [ERROR] 缺少 API KEY 環境變數")
-        return "⚠️ 伺服器配置錯誤，請檢查環境變數。"
-
-    clean_city = city.replace("臺", "台")
-    special_cases = {
-        "淡水": "Tamsui", "淡水區": "Tamsui",
-        "清水": "Qingshui", "清水區": "Qingshui",
-        "羅東": "Luodong", "宜蘭": "Yilan"
-    }
-    
-    if clean_city in special_cases:
-        search_query = f"{special_cases[clean_city]},TW"
-        print(f">>> [LOG] 觸發特殊地點補丁: {clean_city} -> {search_query}")
-    else:
-        tmp_city = clean_city
-        for suffix in ["市", "縣", "區", "鄉", "鎮"]:
-            if tmp_city.endswith(suffix):
-                tmp_city = tmp_city[:-1]
-        search_query = f"{tmp_city},TW" if not any(c.isalpha() for c in tmp_city) else tmp_city
+    # 特殊地名硬編碼補丁 (確保精準度)
+    special_cases = {"淡水": "Tamsui", "清水": "Qingshui", "羅東": "Luodong"}
+    search_query = f"{special_cases[clean_city]},TW" if clean_city in special_cases else f"{clean_city},TW"
 
     try:
+        # 取得台灣時間
         tw_time = datetime.utcnow() + timedelta(hours=8)
         today_date = tw_time.strftime("%Y-%m-%d")
 
@@ -41,48 +28,54 @@ def get_weather_info(city, date_str=None):
         geo_res = requests.get(geo_url).json()
         
         if not geo_res:
-            print(f">>> [WARNING] 地理編碼找不到地點: {search_query}")
-            return f"❓ 抱歉，找不到「{city}」的地點資訊。"
-            
-        lat = geo_res[0]['lat']
-        lon = geo_res[0]['lon']
-        print(f">>> [LOG] 成功取得座標: {lat}, {lon}")
+            print(f">>> [WARNING] 找不到地點: {search_query}")
+            return f"❓ 抱歉，系統找不到「{city_name}」的地點資訊。"
 
-        # 請求氣象
+        lat, lon = geo_res[0]['lat'], geo_res[0]['lon']
+        
+        # 請求氣象 (修正 zh_tw 語系)
         weather_url = f"https://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=zh_tw"
         w_data = requests.get(weather_url).json()
 
         current = w_data['list'][0]
         temp = current['main']['temp']
-        desc = current['weather'][0]['description']
+        desc = current['weather'][0]['description'].replace("多云", "多雲").replace("阴", "陰")
         
-        # 組合回傳字串
-        response = (
+        return (
             f"🌍 氣象服務連線成功！\n({today_date})\n"
             f"--------------------------\n"
-            f"📍 地點：{city}\n🌡️ 溫度：{temp}°C\n☁️ 狀態：{desc}\n"
+            f"📍 地點：{city_name} [TW]\n"
+            f"🌡️ 溫度：{temp}°C\n"
+            f"☁️ 狀態：{desc}\n"
+            f"--------------------------\n"
+            f"💡 建議：💡 天氣多變，出門請留意！\n"
             f"--------------------------"
         )
-        
-        # 後台日誌：記錄最終噴給使用者的結果
-        print(f">>> [SUCCESS] 查詢成功，回傳結果:\n{response}")
-        return response
-
     except Exception as e:
-        print(f">>> [CRITICAL] 執行時發生崩潰: {str(e)}")
-        return "⚠️ 氣象數據解析失敗。"
+        print(f">>> [ERROR] 氣象抓取失敗: {e}")
+        return "⚠️ 服務暫時無法取得數據。"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
     req = request.get_json(silent=True, force=True)
-    # 記錄 Dialogflow 傳來的原始 JSON (除錯神助手)
-    # print(f">>> [DEBUG] Dialogflow Request: {req}") 
-    
     params = req.get('queryResult', {}).get('parameters', {})
     raw_location = params.get('location')
-    
-    # 提取城市... (省略重複邏輯)
-    query_city = str(raw_location) # 簡化示範
+
+    # --- 關鍵修正：解析 Dialogflow 的複雜地點字典 ---
+    query_city = ""
+    if isinstance(raw_location, dict):
+        # 按照優先順序抓取可能存在的欄位
+        query_city = raw_location.get('subadmin-area') or \
+                     raw_location.get('city') or \
+                     raw_location.get('admin-area') or \
+                     raw_location.get('business-name')
+    else:
+        query_city = str(raw_location)
+
+    print(f">>> [LOG] 解析出的城市名: {query_city}")
+
+    if not query_city or query_city.strip() == "" or query_city.lower() == "none":
+        return jsonify({"fulfillmentText": "請問您想查詢哪個城市？"})
 
     reply = get_weather_info(query_city)
     return jsonify({"fulfillmentText": reply})
