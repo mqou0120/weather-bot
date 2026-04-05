@@ -8,7 +8,7 @@ API_KEY = os.environ.get("WEATHER_API_KEY")
 
 def final_fix_text(text):
     if not text: return ""
-    mapping = {"板桥": "板橋", "桥": "橋", "东": "東", "东京": "東京", "阴": "陰", "多云": "多雲", "阵雨": "陣雨", "臺": "台"}
+    mapping = {"板桥": "板橋", "桥": "橋", "东": "東", "东京": "東京", "阴": "陰", "多云": "多雲", "阵雨": "陣雨", "臺": "台", "街道": ""}
     for s, t in mapping.items():
         text = text.replace(s, t)
     return text
@@ -21,24 +21,36 @@ def get_weather_info(city_name, target_date_str=None):
     is_query_today = True if (not target_date_str or target_date_str == today_str) else False
     display_date = target_date_str if target_date_str else today_str
 
-    # 搜尋強化：強制補上 TW 避免找到國外
-    search_q = f"{city_name},TW"
-
     try:
-        geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={search_q}&limit=1&appid={API_KEY}"
+        # 1. 第一輪嘗試：直接搜尋 (支援國外)
+        geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={city_name}&limit=5&appid={API_KEY}"
         geo_res = requests.get(geo_url, timeout=5).json()
         
+        # 2. 如果直接搜不到，且包含台灣地名，嘗試加上 TW 鎖定
+        if not geo_res and any(x in city_name for x in ["板橋", "新北", "台北", "台中", "台南", "高雄"]):
+            geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={city_name},TW&limit=1&appid={API_KEY}"
+            geo_res = requests.get(geo_url, timeout=5).json()
+
         if not geo_res:
             return f"❓ 找不到「{city_name}」的地點資訊"
 
+        # 3. 台灣優先篩選策略
         target = geo_res[0]
-        lat, lon = target['lat'], target['lon']
+        for item in geo_res:
+            # 如果結果中有台灣的座標，優先選擇台灣
+            if (21.8 < item['lat'] < 25.5) and (119.5 < item['lon'] < 122.5):
+                target = item
+                break
         
-        # 名稱修正邏輯
+        lat, lon = target['lat'], target['lon']
+        country = target.get('country', '??')
+        
+        # 4. 名稱修正 (處理新北變台北問題)
         location_name = final_fix_text(target.get('local_names', {}).get('zh', target['name']))
         if "新北" in city_name: location_name = "新北市"
         elif "板橋" in city_name: location_name = "板橋區"
 
+        # 5. 抓取天氣數據
         if is_query_today:
             url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={API_KEY}&units=metric&lang=zh_tw"
             data = requests.get(url, timeout=5).json()
@@ -55,19 +67,20 @@ def get_weather_info(city_name, target_date_str=None):
             temp = target_entry['main']['temp']
             desc = target_entry['weather'][0]['description']
 
-        res = f"🌍 氣象服務連線成功！\n({display_date})\n--------------------------\n📍 地點：{location_name} [TW]\n🌡️ 溫度：{temp}°C\n☁️ 狀態：{final_fix_text(desc)}\n"
+        # 6. 組合訊息
+        res = f"🌍 氣象服務連線成功！\n({display_date})\n--------------------------\n📍 地點：{location_name} [{country}]\n🌡️ 溫度：{temp}°C\n☁️ 狀態：{final_fix_text(desc)}\n"
+        
         if is_query_today:
-            # 獲取 AQI
             aqi_url = f"http://api.openweathermap.org/data/2.5/air_pollution?lat={lat}&lon={lon}&appid={API_KEY}"
-            aqi_res = requests.get(aqi_url, timeout=3).json()
-            pm25 = aqi_res['list'][0]['components'].get('pm2_5', 0)
+            aqi_data = requests.get(aqi_url, timeout=3).json()
+            pm25 = aqi_data['list'][0]['components'].get('pm2_5', 0)
             aqi_str = "良好" if pm25 <= 15.4 else "普通" if pm25 <= 35.4 else "對敏感族群不健康"
             res += f"🌬️ 空氣品質：{aqi_str}\n"
             
         res += "--------------------------\n💡 建議：😊 祝您有美好的一天！\n--------------------------"
         return res
     except:
-        return "⚠️ 獲取數據失敗，請稍後再試。"
+        return "⚠️ 獲取氣象數據失敗。"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -76,30 +89,28 @@ def webhook():
         query_res = req.get('queryResult', {})
         params = query_res.get('parameters', {})
         
-        # 核心修正 1：對應 JSON 中的 'date-time'
+        # 解析日期 (支援 date-time 陣列)
         date_list = params.get('date-time') or params.get('date') or []
         target_date = None
-        if date_list and isinstance(date_list, list):
+        if isinstance(date_list, list) and len(date_list) > 0:
             target_date = str(date_list[0]).split('T')[0]
         elif isinstance(date_list, str):
             target_date = date_list.split('T')[0]
 
-        # 核心修正 2：精準抓取 location 陣列中的 city
+        # 解析地點 (支援多層 location 結構)
         city = ""
         loc_list = params.get('location', [])
-        if loc_list and isinstance(loc_list, list):
+        if isinstance(loc_list, list) and len(loc_list) > 0:
             item = loc_list[0]
-            if isinstance(item, dict):
-                city = item.get('city') or item.get('subadmin-area') or item.get('admin-area')
+            city = item.get('city') or item.get('subadmin-area') or item.get('admin-area') if isinstance(item, dict) else str(item)
         
-        # 最終保險：如果參數抓不到，拿 QueryText 並過濾贅字
         if not city or "None" in str(city):
             city = query_res.get('queryText', '').replace("明天","").replace("天氣","").replace("如何","").replace("？","").strip()
 
         reply = get_weather_info(city, target_date_str=target_date)
         return jsonify({"fulfillmentText": reply})
-    except Exception as e:
-        return jsonify({"fulfillmentText": f"⚠️ 解析失敗。"})
+    except:
+        return jsonify({"fulfillmentText": "⚠️ 解析失敗。"})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
