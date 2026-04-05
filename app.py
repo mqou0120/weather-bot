@@ -1,11 +1,10 @@
 import os
 import requests
 from flask import Flask, request, jsonify
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
-# 從環境變數讀取 OpenWeather API Key
 OPENWEATHER_API_KEY = os.environ.get("WEATHER_API_KEY")
 
 def get_weather_info(city, date_str=None):
@@ -13,10 +12,15 @@ def get_weather_info(city, date_str=None):
         return "⚠️ 伺服器配置錯誤，請檢查環境變數。"
 
     try:
-        # 1. 取得地理座標 (Geocoding)
-        # 邏輯：如果輸入不含英文，自動補上 ,TW 鎖定台灣，避免跑去日本或阿根廷
+        # --- 修正 1：時區校正 (強制加 8 小時得到台灣時間) ---
+        # 這樣就不會因為伺服器在國外而日期顯示昨天
+        tw_time = datetime.utcnow() + timedelta(hours=8)
+        today_date = tw_time.strftime("%Y-%m-%d")
+
+        # --- 修正 2：地點鎖定與繁體補強 ---
+        # 如果使用者輸入板橋、台北等中文，強制加上 ,TW
         search_query = city
-        if not any(c.isalpha() for c in city): 
+        if not any(c.isalpha() for c in city):
             search_query = f"{city},TW"
 
         geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={search_query}&limit=1&appid={OPENWEATHER_API_KEY}"
@@ -27,28 +31,25 @@ def get_weather_info(city, date_str=None):
             
         lat = geo_res[0]['lat']
         lon = geo_res[0]['lon']
-        country = geo_res[0].get('country', '')
         
-        # 繁體中文優化：優先抓取本地化名稱
+        # 抓取繁體中文名稱並過濾簡體
         local_names = geo_res[0].get('local_names', {})
         location_name = local_names.get('zh-tw') or local_names.get('zh') or geo_res[0]['name']
+        location_name = location_name.replace("多云", "多雲").replace("阴", "陰")
         
-        # 2. 取得氣象數據 (使用 5 day / 3 hour forecast)
+        country = geo_res[0].get('country', '')
+
+        # --- 修正 3：氣象數據與繁體中文強轉 ---
         weather_url = f"https://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric&lang=zh_tw"
         w_data = requests.get(weather_url).json()
 
-        # 抓取第一筆預報資料
         current = w_data['list'][0]
         temp = current['main']['temp']
         desc = current['weather'][0]['description']
         
-        # 強制修正部分 API 回傳的簡體字補丁
+        # 針對回傳字串做最後的繁體補丁
         desc = desc.replace("多云", "多雲").replace("阴", "陰").replace("阵雨", "陣雨").replace("晴", "晴朗")
         
-        # 取得今天日期
-        today_date = datetime.now().strftime("%Y-%m-%d")
-        
-        # 3. 根據天氣給予建議與對應表情
         suggestion = "天氣不錯，出門走走吧！"
         suggest_emoji = "☀️"
         if "雨" in desc:
@@ -61,8 +62,7 @@ def get_weather_info(city, date_str=None):
             suggestion = "有些涼意，加件薄外套吧！"
             suggest_emoji = "🧥"
 
-        # --- 依照要求格式進行排版 ---
-        response = (
+        return (
             f"🌍 氣象服務連線成功！\n"
             f"({today_date})\n"
             f"--------------------------\n"
@@ -73,50 +73,30 @@ def get_weather_info(city, date_str=None):
             f"💡 建議：{suggest_emoji} {suggestion}\n"
             f"--------------------------"
         )
-        return response
 
     except Exception as e:
-        print(f"Runtime Error: {e}")
-        return "⚠️ 氣象數據抓取失敗，請稍後再試。"
-
-@app.route('/')
-def index():
-    return "Weather Bot is Online and Secure!"
+        return "⚠️ 數據解析失敗，請確認 API 配置。"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    # (此部分維持之前的解析邏輯)
     req = request.get_json(silent=True, force=True)
-    query_result = req.get('queryResult', {})
-    params = query_result.get('parameters', {})
-    
-    # --- 深度解析地點參數 (解決只講地名沒反應的問題) ---
+    params = req.get('queryResult', {}).get('parameters', {})
     raw_location = params.get('location')
-    query_city = ""
     
+    query_city = ""
     if isinstance(raw_location, dict):
-        query_city = raw_location.get('city') or raw_location.get('admin-area') or raw_location.get('subadmin-area')
+        query_city = raw_location.get('city') or raw_location.get('admin-area')
     elif isinstance(raw_location, list) and len(raw_location) > 0:
         item = raw_location[0]
-        if isinstance(item, dict):
-            query_city = item.get('city') or item.get('admin-area')
-        else:
-            query_city = str(item)
+        query_city = item.get('city') if isinstance(item, dict) else str(item)
     else:
         query_city = str(raw_location)
 
-    # 清理字串
-    query_city = query_city.strip()
-    if not query_city or query_city.lower() == "none" or query_city == "":
-        return jsonify({"fulfillmentText": "請問您想查詢哪個城市的天氣？"})
+    if not query_city or query_city.lower() == "none":
+        return jsonify({"fulfillmentText": "請問您想查詢哪個城市？"})
 
-    # 執行查詢
-    reply_text = get_weather_info(query_city)
-    
-    return jsonify({
-        "fulfillmentText": reply_text
-    })
+    return jsonify({"fulfillmentText": get_weather_info(query_city)})
 
 if __name__ == '__main__':
-    # Render 環境會自動分配 PORT
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
