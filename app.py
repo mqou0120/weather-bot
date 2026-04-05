@@ -9,7 +9,6 @@ API_KEY = os.environ.get("WEATHER_API_KEY")
 def force_traditional(text):
     """徹底轉換簡體字、大陸用語及統一台字"""
     if not text: return ""
-    # 強制替換表，涵蓋你截圖中出現的所有問題字
     mapping = {
         "板桥": "板橋", "东京": "東京", "东": "東", "桥": "橋",
         "阴": "陰", "多云": "多雲", "阵雨": "陣雨", "镇": "區", 
@@ -17,7 +16,7 @@ def force_traditional(text):
         "湾": "灣", "义": "義", "臺": "台", "层": "層", 
         "雾": "霧", "雷": "雷", "实": "實", "气": "氣", 
         "观": "觀", "测": "測", "晴间多云": "晴時多雲", 
-        "，": " ", "区": "區"
+        "，": " ", "区": "區", "街道": "" # 移除錯誤的「街道」後綴
     }
     for s, t in mapping.items():
         text = text.replace(s, t)
@@ -39,43 +38,61 @@ def get_aqi_info(lat, lon):
 def get_weather_info(city, is_today=True):
     if not API_KEY: return "⚠️ 請設定 API KEY"
 
-    # 地名清洗：統一用繁體「台」進行搜尋
-    clean_city = str(city).replace("臺", "台").replace("市", "").replace("縣", "").replace("區", "").strip()
-    search_query = f"{clean_city},TW" if not any(c.isalpha() for c in clean_city) else clean_city
+    # 1. 強化搜尋策略：如果使用者打「新北/新北市」，強制轉換為精準搜尋詞
+    raw_city = str(city).strip()
+    if "新北" in raw_city:
+        search_query = "New Taipei City,TW"
+    else:
+        # 一般地名清洗，並加上 ,TW 強制鎖定台灣
+        clean_city = raw_city.replace("臺", "台").replace("市", "").replace("縣", "").replace("區", "").strip()
+        search_query = f"{clean_city},TW" if not any(c.isalpha() for c in clean_city) else clean_city
 
     try:
-        # 1. 地點搜尋
-        geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={search_query}&limit=1&appid={API_KEY}"
+        # 2. 地點搜尋 (增加回傳數量以供篩選)
+        geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={search_query}&limit=5&appid={API_KEY}"
         geo_res = requests.get(geo_url, timeout=3).json()
-        if not geo_res: return f"❓ 找不到「{city}」的地點資訊"
-
-        data = geo_res[0]
-        lat, lon = data['lat'], data['lon']
-        country = data.get('country', '??')
         
-        # 強制校正台灣國碼 (避免回傳 CN)
-        if country == "CN" and (21.8 < lat < 25.5) and (119.5 < lon < 122.5):
+        if not geo_res:
+            return f"❓ 找不到「{city}」的地點資訊"
+
+        # 3. 台灣優先篩選邏輯：從結果中挑選座標在台灣範圍內的
+        target_data = geo_res[0] # 預設選第一個
+        for item in geo_res:
+            lat, lon = item['lat'], item['lon']
+            if (21.8 < lat < 25.5) and (119.5 < lon < 122.5):
+                target_data = item
+                break # 找到台灣的就跳出
+
+        lat, lon = target_data['lat'], target_data['lon']
+        country = target_data.get('country', '??')
+        
+        # 強制校正台灣座標的國碼 (針對板橋回傳 CN 的錯誤)
+        if (21.8 < lat < 25.5) and (119.5 < lon < 122.5):
             country = "TW"
 
-        # 取得名稱並立即通過繁體過濾器
-        location_name = data.get('local_names', {}).get('zh', data['name'])
+        # 取得名稱並校正（處理新北被標為台北或新北街道的問題）
+        location_name = target_data.get('local_names', {}).get('zh', target_data['name'])
         location_name = force_traditional(location_name)
+        
+        # 特殊修正：如果搜新北卻回傳台北，手動校正顯示名稱
+        if "新北" in raw_city and "台北" in location_name:
+            location_name = "新北市"
 
-        # 2. 天氣數據
+        # 4. 天氣數據
         w_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={API_KEY}&units=metric&lang=zh_tw"
         w_data = requests.get(w_url, timeout=3).json()
         
         temp = w_data.get('main', {}).get('temp', "--")
         desc = force_traditional(w_data.get('weather', [{}])[0].get('description', "未知"))
 
-        # 3. 建議內容
+        # 5. 建議內容
         suggest = "😊 氣溫舒適，是出門的好天氣。"
         if "雨" in desc: suggest = "☔ 記得帶把傘，注意安全。"
         elif isinstance(temp, (int, float)):
             if temp >= 28: suggest = "🥵 天氣炎熱，請多補充水分。"
             elif temp <= 18: suggest = "🧥 氣溫偏低，記得穿件外套。"
 
-        # 4. 格式組合 (嚴格遵守你的範例)
+        # 6. 組合格式
         date_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
         
         output = (
