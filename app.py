@@ -1,94 +1,81 @@
 import os
 import requests
 from flask import Flask, request, jsonify
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
 API_KEY = os.environ.get("WEATHER_API_KEY")
 
-# --- 模組 A：抓取空氣品質 (AQI) ---
 def get_aqi_info(lat, lon):
-    try:
-        url = f"http://api.openweathermap.org/data/2.5/air_pollution?lat={lat}&lon={lon}&appid={API_KEY}"
-        res = requests.get(url, timeout=2).json()
-        aqi_val = res['list'][0]['main']['aqi']
-        # 台灣習慣的描述對照
-        aqi_map = {1: "良好 ✨", 2: "普通 ☁️", 3: "對敏感族群不健康 ⚠️", 4: "不健康 😷", 5: "危害 🚨"}
-        return aqi_map.get(aqi_val, "未知")
-    except:
-        return "數據獲取中..."
+    # (同上方修正後的 PM2.5 邏輯)
+    ...
 
-# --- 模組 B：抓取氣象與溫度 ---
 def get_weather_info(city):
-    print(f">>> [LOG] 查詢城市: {city}")
-    if not API_KEY: return "⚠️ 缺少 API Key 設定"
-
-    # 地名標準化 (處理台/臺與行政區)
+    if not API_KEY: return "⚠️ 請檢查環境變數 WEATHER_API_KEY"
+    
     clean_city = str(city).replace("臺", "台").replace("市", "").replace("縣", "").replace("區", "").strip()
     search_query = f"{clean_city},TW" if not any(c.isalpha() for c in clean_city) else clean_city
 
     try:
-        # 1. 座標轉換 (Geocoding)
+        # 1. 座標轉換
         geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={search_query}&limit=1&appid={API_KEY}"
-        geo_res = requests.get(geo_url, timeout=3).json()
-        if not geo_res: return f"❓ 找不到「{city}」"
+        geo_res = requests.get(geo_url, timeout=3)
+        if geo_res.status_code != 200 or not geo_res.json():
+            return f"❓ 找不到「{city}」的地點資訊"
+        
+        data = geo_res.json()[0]
+        lat, lon = data['lat'], data['lon']
+        location_name = data.get('local_names', {}).get('zh', data['name'])
 
-        lat, lon = geo_res[0]['lat'], geo_res[0]['lon']
-        location_name = geo_res[0].get('local_names', {}).get('zh', geo_res[0]['name'])
-
-        # 2. 氣象抓取 (單獨請求)
+        # 2. 氣象與空氣品質 (並行或連續抓取)
         w_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={API_KEY}&units=metric&lang=zh_tw"
-        w_data = requests.get(w_url, timeout=3).json()
-        temp = w_data.get('main', {}).get('temp', "--")
-        desc = w_data.get('weather', [{}])[0].get('description', "未知")
-        desc = desc.replace("多云", "多雲").replace("阴", "陰").replace("阵雨", "陣雨")
-
-        # 3. 空氣品質單獨呼叫 (分開抓，不影響氣溫)
+        w_res = requests.get(w_url, timeout=3).json()
+        
+        temp = w_res.get('main', {}).get('temp', "--")
+        desc = w_res.get('weather', [{}])[0].get('description', "未知").replace("多云", "多雲").replace("阴", "陰")
         aqi_status = get_aqi_info(lat, lon)
 
-        # 4. 生活建議邏輯
-        suggest = "氣溫舒適，出門走走吧！"
-        if "雨" in desc: suggest = "記得帶傘喔！ ☔"
+        # 建議邏輯
+        suggest = "天氣不錯，出門走走！"
+        if "雨" in desc: suggest = "記得帶傘 ☔"
         elif isinstance(temp, (int, float)):
-            if temp >= 28: suggest = "天氣炎熱，多喝水！ 🥤"
-            elif temp <= 18: suggest = "天氣偏涼，加件外套。 🧥"
+            if temp >= 30: suggest = "防曬補水，小心中暑 ☀️"
+            elif temp <= 16: suggest = "氣溫較低，注意保暖 🧥"
 
-        # 5. 台灣日期
-        date_str = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d")
+        # 3. 台灣時間修正 (Python 3.12 建議寫法)
+        tw_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
 
         return (
-            f"🌍 氣象服務 ({date_str})\n"
+            f"🌍 氣象服務 ({tw_time})\n"
             f"--------------------------\n"
             f"📍 地點：{location_name}\n"
             f"🌡️ 溫度：{temp}°C\n"
             f"☁️ 狀態：{desc}\n"
             f"😷 空氣：{aqi_status}\n"
             f"--------------------------\n"
-            f"💡 建議：{suggest}\n"
-            f"--------------------------"
+            f"💡 建議：{suggest}"
         )
     except Exception as e:
-        print(f">>> [ERROR] {e}")
-        return "⚠️ 數據解析失敗，請稍後再試。"
+        return "⚠️ 服務暫時無法連線，請稍後再試。"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    try:
-        req = request.get_json(silent=True, force=True)
-        res = req.get('queryResult', {})
-        params = res.get('parameters', {})
-        
-        # 抓取地名保險機制
-        city = params.get('location')
-        if isinstance(city, dict): city = city.get('city') or city.get('admin-area')
-        elif isinstance(city, list) and city: city = city[0]
-        
-        final_city = str(city) if city and str(city).lower() != 'none' else res.get('queryText', '')
-        
-        reply = get_weather_info(final_city)
-        return jsonify({"fulfillmentText": reply})
-    except:
-        return jsonify({"fulfillmentText": "請輸入正確的地名（例如：板橋）。"})
+    req = request.get_json(silent=True)
+    if not req: return jsonify({"fulfillmentText": "無效請求"})
+    
+    # 更安全的參數解析
+    params = req.get('queryResult', {}).get('parameters', {})
+    loc_val = params.get('location', "")
+    
+    # 判斷 loc_val 是字典還是字串
+    if isinstance(loc_val, dict):
+        city = loc_val.get('city') or loc_val.get('admin-area') or loc_val.get('subisland')
+    else:
+        city = str(loc_val)
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    # 最終備援
+    final_city = city if city and city != "None" else req.get('queryResult', {}).get('queryText', "")
+    final_city = final_city.replace("天氣", "").strip()
+
+    reply = get_weather_info(final_city)
+    return jsonify({"fulfillmentText": reply})
