@@ -34,108 +34,110 @@ def get_aqi_info(lat, lon):
     except:
         return "數據獲取中"
 
-def get_weather_info(user_input_city, is_today=True):
+def get_weather_info(user_input_city, target_date_str=None):
+    """
+    target_date_str: 格式為 YYYY-MM-DD 的日期字串
+    """
     if not API_KEY: return "⚠️ 未偵測到 API 金鑰"
+
+    # 判斷是否為查詢今天
+    tw_now = datetime.now(timezone(timedelta(hours=8)))
+    today_str = tw_now.strftime("%Y-%m-%d")
+    
+    # 如果沒傳日期或日期就是今天，則視為查詢當前
+    is_query_today = True if (not target_date_str or target_date_str == today_str) else False
+    display_date = target_date_str if target_date_str else today_str
 
     display_city = user_input_city.strip()
     search_city = display_city.replace("臺", "台")
     
     # 處理新北市特別邏輯
     is_requesting_new_taipei = "新北" in display_city
-    if is_requesting_new_taipei:
-        search_query = "New Taipei City,TW"
-    else:
-        search_query = f"{search_city},TW" if not any(c.isalpha() for c in search_city) else search_city
+    search_query = "New Taipei City,TW" if is_requesting_new_taipei else f"{search_city},TW"
 
     try:
-        # 1. 地點搜尋
+        # 1. 地點搜尋並鎖定台灣座標
         geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={search_query}&limit=5&appid={API_KEY}"
         geo_res = requests.get(geo_url, timeout=3).json()
         if not geo_res: return f"❓ 找不到「{user_input_city}」的地點資訊"
 
-        # 2. 篩選台灣座標
         target = geo_res[0]
-        is_in_taiwan = False
         for item in geo_res:
-            lat, lon = item['lat'], item['lon']
-            if (21.8 < lat < 25.5) and (119.5 < lon < 122.5):
+            if (21.8 < item['lat'] < 25.5) and (119.5 < item['lon'] < 122.5):
                 target = item
-                is_in_taiwan = True
                 break
 
         lat, lon = target['lat'], target['lon']
-        country = "TW" if is_in_taiwan else target.get('country', '??')
+        country = "TW" if (21.8 < lat < 25.5) else target.get('country', '??')
 
-        # 3. 強制修正顯示名稱 (解決新北變台北的問題)
+        # 2. 名稱強制修正
         location_name = final_fix_text(target.get('local_names', {}).get('zh', target['name']))
-        if is_requesting_new_taipei:
-            location_name = "新北市"
-        elif "板橋" in display_city:
-            location_name = "板橋區"
+        if is_requesting_new_taipei: location_name = "新北市"
+        elif "板橋" in display_city: location_name = "板橋區"
 
-        # 4. 抓取氣象數據
-        w_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={API_KEY}&units=metric&lang=zh_tw"
-        w_res = requests.get(w_url, timeout=3).json()
-        temp = w_res.get('main', {}).get('temp', "--")
-        desc = final_fix_text(w_res.get('weather', [{}])[0].get('description', "未知"))
+        # 3. 獲取天氣 (若是今天查 Current，若是未來查 Forecast)
+        if is_query_today:
+            w_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={API_KEY}&units=metric&lang=zh_tw"
+            w_res = requests.get(w_url, timeout=3).json()
+            temp = w_res.get('main', {}).get('temp', "--")
+            desc = final_fix_text(w_res.get('weather', [{}])[0].get('description', "未知"))
+        else:
+            # 查詢明後天 (使用 5 day / 3 hour forecast)
+            f_url = f"https://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}&appid={API_KEY}&units=metric&lang=zh_tw"
+            f_res = requests.get(f_url, timeout=3).json()
+            # 尋找最接近目標日期中午 12:00 的數據
+            forecast_list = f_res.get('list', [])
+            target_data = forecast_list[0] # 預設值
+            for entry in forecast_list:
+                if target_date_str in entry.get('dt_txt', ''):
+                    target_data = entry
+                    if "12:00:00" in entry.get('dt_txt', ''): break
+            temp = target_data.get('main', {}).get('temp', "--")
+            desc = final_fix_text(target_data.get('weather', [{}])[0].get('description', "未知"))
 
-        # 5. 建議
-        suggest = "😊 氣溫舒適，是出門的好天氣。"
-        if "雨" in desc: suggest = "☔ 記得帶把傘，注意安全。"
-        elif isinstance(temp, (int, float)):
-            if temp >= 28: suggest = "🥵 天氣炎熱，請多補充水分。"
-            elif temp <= 18: suggest = "🧥 氣溫偏低，記得穿件外套。"
-
-        # 6. 組合回應格式
-        date_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        # 4. 格式化回應
         res_text = (
             f"🌍 氣象服務連線成功！\n"
-            f"({date_str})\n"
+            f"({display_date})\n"
             f"--------------------------\n"
             f"📍 地點：{location_name} [{country}]\n"
             f"🌡️ 溫度：{temp}°C\n"
             f"☁️ 狀態：{desc}\n"
         )
-        if is_today:
+        
+        # 核心修正：僅「今天」顯示空氣品質
+        if is_query_today:
             aqi_val = get_aqi_info(lat, lon)
             res_text += f"🌬️ 空氣品質：{aqi_val}\n"
-        res_text += f"--------------------------\n💡 建議：{suggest}\n--------------------------"
+            
+        res_text += f"--------------------------\n💡 建議：😊 氣溫舒適，是出門的好天氣。\n--------------------------"
         return res_text
-    except:
-        return "⚠️ 系統連線異常，請稍後再試。"
+    except Exception as e:
+        return f"⚠️ 系統異常，請稍後再試。"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    try:
-        req = request.get_json(silent=True, force=True)
-        query_res = req.get('queryResult', {})
-        params = query_res.get('parameters', {})
-        
-        # 判斷時間
-        date_param = params.get('date', '')
-        is_today = True
-        if date_param:
-            today_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
-            if today_str not in str(date_param): is_today = False
+    req = request.get_json(silent=True, force=True)
+    query_res = req.get('queryResult', {})
+    params = query_res.get('parameters', {})
+    
+    # 提取日期參數 (Dialogflow 格式為 2026-04-06T12:00:00+08:00)
+    raw_date = params.get('date', '')
+    target_date = raw_date.split('T')[0] if raw_date else None
 
-        # 抓取地名
-        loc_val = params.get('location', "")
-        city = ""
-        if isinstance(loc_val, list) and loc_val:
-            item = loc_val[0]
-            city = item.get('subadmin-area') or item.get('city') if isinstance(item, dict) else str(item)
-        elif isinstance(loc_val, dict):
-            city = loc_val.get('subadmin-area') or loc_val.get('city')
-        else:
-            city = str(loc_val)
+    # 提取地點
+    loc_val = params.get('location', "")
+    city = ""
+    if isinstance(loc_val, dict):
+        city = loc_val.get('city') or loc_val.get('subadmin-area') or loc_val.get('admin-area')
+    else:
+        city = str(loc_val)
 
-        if not city or str(city).lower() == "none" or city == "{}":
-            city = query_res.get('queryText', '')
+    if not city or city == "{}" or city.lower() == "none":
+        city = query_res.get('queryText', '')
 
-        reply = get_weather_info(city.replace("天氣", "").strip(), is_today=is_today)
-        return jsonify({"fulfillmentText": reply})
-    except:
-        return jsonify({"fulfillmentText": "數據解析失敗，請稍後再試。"})
+    reply = get_weather_info(city.replace("天氣", "").strip(), target_date_str=target_date)
+    return jsonify({"fulfillmentText": reply})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
