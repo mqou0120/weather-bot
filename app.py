@@ -14,67 +14,57 @@ def final_fix_text(text):
     return text
 
 def get_smart_advice(temp, desc):
-    """根據溫度與天氣狀態提供自動化建議"""
     advice_list = []
-    
-    # 1. 針對天氣狀態的建議
     if "雨" in desc:
         advice_list.append("☔ 記得帶把傘出門，路面濕滑請注意安全。")
     elif "雲" in desc or "陰" in desc:
-        advice_list.append("☁️ 天氣較陰沉，雖然不一定下雨但建議帶件輕便外套。")
+        advice_list.append("☁️ 天氣較陰沉，建議帶件輕便外套。")
     elif "晴" in desc:
-        advice_list.append("☀️ 陽光露臉，出門別忘了防曬或戴太陽眼鏡。")
-    elif "霧" in desc:
-        advice_list.append("🌫️ 濃霧能見度低，開車請慢行並開啟霧燈。")
-
-    # 2. 針對溫度的建議
+        advice_list.append("☀️ 陽光露臉，別忘了防曬。")
+    
     try:
         t = float(temp)
-        if t >= 30:
-            advice_list.append("🥵 天氣炎熱，請多補充水分以防中暑。")
-        elif t <= 16:
-            advice_list.append("🧣 氣溫偏低，出門請做好保暖禦寒。")
-        elif 17 <= t <= 24:
-            advice_list.append("👕 涼爽舒適，適合穿長袖薄外套。")
-        else:
-            advice_list.append("😊 氣溫適中，是個適合出遊的好日子！")
+        if t >= 30: advice_list.append("🥵 氣溫炎熱，請多補水。")
+        elif t <= 16: advice_list.append("🧣 氣溫偏低，請做好保暖。")
+        else: advice_list.append("😊 氣溫適中，祝你有個好心情！")
     except:
-        advice_list.append("😊 祝您今天有個好心情！")
-
-    # 隨機挑選或組合 (這裡取兩條建議組合)
+        pass
     return " ".join(advice_list[:2])
 
 def get_weather_info(city_name, target_date_str=None):
     if not API_KEY: return "⚠️ 未偵測到 API 金鑰"
     
+    # 1. 清理城市名稱，移除贅字並強制加上台灣代碼
+    search_query = city_name.replace("區", "").replace("市", "").replace("天氣", "").strip()
+    if not search_query: return "❓ 請問您想查詢哪個地區的天氣？"
+
     tw_now = datetime.now(timezone(timedelta(hours=8)))
     today_str = tw_now.strftime("%Y-%m-%d")
     is_query_today = True if (not target_date_str or target_date_str == today_str) else False
     display_date = target_date_str if target_date_str else today_str
 
     try:
-        # 搜尋地點
-        geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={city_name}&limit=5&appid={API_KEY}"
+        # 2. 地理編碼搜尋：強制加上 ,TW 限制在台灣
+        geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={search_query},TW&limit=5&appid={API_KEY}"
         geo_res = requests.get(geo_url, timeout=5).json()
         
-        if not geo_res and any(x in city_name for x in ["板橋", "新北", "台北", "台中", "台南", "高雄"]):
-            geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={city_name},TW&limit=1&appid={API_KEY}"
-            geo_res = requests.get(geo_url, timeout=5).json()
+        if not geo_res:
+            return f"❓ 找不到「{city_name}」在台灣的地點資訊。"
 
-        if not geo_res: return f"❓ 找不到「{city_name}」的地點資訊"
-
-        target = geo_res[0]
+        # 3. 嚴格經緯度過濾 (確保在台灣範圍內)
+        target = None
         for item in geo_res:
-            if (21.8 < item['lat'] < 25.5) and (119.5 < item['lon'] < 122.5):
+            lat, lon = item['lat'], item['lon']
+            if (21.8 < lat < 25.5) and (119.5 < lon < 122.5):
                 target = item
                 break
         
+        if not target: target = geo_res[0] # 若無過濾結果則取第一個
+
         lat, lon = target['lat'], target['lon']
         location_name = final_fix_text(target.get('local_names', {}).get('zh', target['name']))
-        if "新北" in city_name: location_name = "新北市"
-        elif "板橋" in city_name: location_name = "板橋區"
 
-        # 抓取天氣
+        # 4. 抓取天氣數據
         if is_query_today:
             url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={API_KEY}&units=metric&lang=zh_tw"
             data = requests.get(url, timeout=5).json()
@@ -91,10 +81,8 @@ def get_weather_info(city_name, target_date_str=None):
             temp = target_entry['main']['temp']
             desc = target_entry['weather'][0]['description']
 
-        # 獲取自動化建議
         smart_advice = get_smart_advice(temp, desc)
-
-        res = f"🌍 氣象服務連線成功！\n({display_date})\n--------------------------\n📍 地點：{location_name} [{target.get('country','??')}]\n🌡️ 溫度：{temp}°C\n☁️ 狀態：{final_fix_text(desc)}\n"
+        res = f"🌍 氣象服務連線成功！\n({display_date})\n--------------------------\n📍 地點：{location_name}\n🌡️ 溫度：{temp}°C\n☁️ 狀態：{final_fix_text(desc)}\n"
         
         if is_query_today:
             aqi_url = f"http://api.openweathermap.org/data/2.5/air_pollution?lat={lat}&lon={lon}&appid={API_KEY}"
@@ -105,8 +93,8 @@ def get_weather_info(city_name, target_date_str=None):
             
         res += f"--------------------------\n💡 建議：{smart_advice}\n--------------------------"
         return res
-    except:
-        return "⚠️ 獲取氣象數據失敗。"
+    except Exception as e:
+        return f"⚠️ 獲取數據失敗，請稍後再試。"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -115,26 +103,28 @@ def webhook():
         query_res = req.get('queryResult', {})
         params = query_res.get('parameters', {})
         
-        date_list = params.get('date-time') or params.get('date') or []
-        target_date = None
-        if isinstance(date_list, list) and len(date_list) > 0:
-            target_date = str(date_list[0]).split('T')[0]
-        elif isinstance(date_list, str):
-            target_date = date_list.split('T')[0]
+        # 解析日期
+        date_input = params.get('date-time') or params.get('date') or ""
+        target_date = str(date_input).split('T')[0] if date_input else None
 
+        # 優先從 Dialogflow Location 參數提取
         city = ""
-        loc_list = params.get('location', [])
-        if isinstance(loc_list, list) and len(loc_list) > 0:
-            item = loc_list[0]
-            city = item.get('city') or item.get('subadmin-area') or item.get('admin-area') if isinstance(item, dict) else str(item)
+        loc_param = params.get('location')
+        if isinstance(loc_param, list) and len(loc_param) > 0:
+            loc_data = loc_param[0]
+            if isinstance(loc_data, dict):
+                city = loc_data.get('city') or loc_data.get('subadmin-area') or loc_data.get('admin-area') or ""
+            else:
+                city = str(loc_data)
         
-        if not city or "None" in str(city):
-            city = query_res.get('queryText', '').replace("明天","").replace("天氣","").replace("如何","").replace("？","").strip()
+        # 如果參數沒抓到，改從原始對話內容解析
+        if not city:
+            city = query_res.get('queryText', '')
 
         reply = get_weather_info(city, target_date_str=target_date)
         return jsonify({"fulfillmentText": reply})
     except:
-        return jsonify({"fulfillmentText": "⚠️ 解析失敗。"})
+        return jsonify({"fulfillmentText": "⚠️ 拍謝，我暫時沒辦法解析這個地點。"})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
