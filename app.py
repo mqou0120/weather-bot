@@ -1,11 +1,98 @@
 import os
 import requests
-from flask import Flask, request, jsonify  # 確保有匯入 Flask
+from flask import Flask, request, jsonify
 from datetime import datetime, timedelta, timezone
 
-# 關鍵點：這一行一定要存在，且名稱必須是小寫的 app
-app = Flask(__name__) 
-
+app = Flask(__name__)
 API_KEY = os.environ.get("WEATHER_API_KEY")
 
-# ... 接下來接續 get_smart_advice, get_weather_info 等函式 ...
+def final_fix_text(text):
+    if not text: return ""
+    mapping = {"板桥": "板橋", "桥": "橋", "东": "東", "东京": "東京", "阴": "陰", "多云": "多雲", "阵雨": "陣雨", "臺": "台", "街道": ""}
+    for s, t in mapping.items():
+        text = text.replace(s, t)
+    return text
+
+def get_smart_advice(temp, desc):
+    advice_list = []
+    if "雨" in desc: advice_list.append("☔ 記得帶把傘。")
+    elif "晴" in desc: advice_list.append("☀️ 陽光露臉，注意防曬。")
+    try:
+        t = float(temp)
+        if t >= 30: advice_list.append("🥵 天氣炎熱。")
+        elif t <= 16: advice_list.append("🧣 氣溫偏低。")
+    except: pass
+    return " ".join(advice_list[:2])
+
+def get_weather_info(city_name, target_date_str=None):
+    if not API_KEY: return "⚠️ 未偵測到 API 金鑰"
+    raw_query = city_name.replace("天氣", "").replace("如何", "").strip()
+    
+    # 地名變體補強
+    search_variants = [f"{raw_query},TW"]
+    if "板橋" in raw_query: search_variants.insert(0, "Banqiao,TW")
+    if "中和" in raw_query: search_variants.insert(0, "Zhonghe,TW")
+
+    tw_now = datetime.now(timezone(timedelta(hours=8)))
+    today_str = tw_now.strftime("%Y-%m-%d")
+    is_query_today = (not target_date_str or target_date_str == today_str)
+    display_date = target_date_str if target_date_str else today_str
+
+    try:
+        geo_res = None
+        for q in search_variants:
+            geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={q}&limit=5&appid={API_KEY}"
+            geo_res = requests.get(geo_url, timeout=5).json()
+            if geo_res: break
+        
+        if not geo_res: return f"❓ 找不到「{raw_query}」的地點。"
+
+        target = next((item for item in geo_res if (21.8 < item['lat'] < 25.5) and (119.5 < item['lon'] < 122.5)), geo_res[0])
+        lat, lon = target['lat'], target['lon']
+        location_name = target.get('local_names', {}).get('zh', target['name'])
+        country_code = target.get('country', 'TW')
+
+        if is_query_today:
+            url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={API_KEY}&units=metric&lang=zh_tw"
+            data = requests.get(url, timeout=5).json()
+            temp, desc = data['main']['temp'], data['weather'][0]['description']
+        else:
+            url = f"https://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}&appid={API_KEY}&units=metric&lang=zh_tw"
+            data = requests.get(url, timeout=5).json()
+            target_entry = next((e for e in data['list'] if display_date in e['dt_txt']), data['list'][0])
+            temp, desc = target_entry['main']['temp'], target_entry['weather'][0]['description']
+
+        res = f"🌍 氣象服務連線成功！\n({display_date})\n--------------------------\n📍 地點：{final_fix_text(location_name)} [{country_code}]\n🌡️ 溫度：{temp}°C\n☁️ 狀態：{final_fix_text(desc)}\n"
+        if is_query_today:
+            aqi_data = requests.get(f"http://api.openweathermap.org/data/2.5/air_pollution?lat={lat}&lon={lon}&appid={API_KEY}").json()
+            pm25 = aqi_data['list'][0]['components'].get('pm2_5', 0)
+            res += f"🌬️ 空氣品質：{'良好' if pm25 <= 15.4 else '普通' if pm25 <= 35.4 else '提醒注意'}\n"
+        
+        return res + f"--------------------------\n💡 建議：{get_smart_advice(temp, desc)}\n--------------------------"
+    except: return "⚠️ 獲取數據失敗。"
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    try:
+        req = request.get_json(silent=True, force=True)
+        query_res = req.get('queryResult', {})
+        params = query_res.get('parameters', {})
+        
+        date_input = params.get('date-time') or params.get('date') or ""
+        target_date = str(date_input).split('T')[0] if date_input else None
+
+        city = ""
+        loc_param = params.get('location')
+        if isinstance(loc_param, list) and len(loc_param) > 0:
+            loc_data = loc_param[0]
+            city = loc_data.get('city') if isinstance(loc_data, dict) else str(loc_data)
+        
+        if not city: city = query_res.get('queryText', '')
+
+        reply = get_weather_info(city, target_date_str=target_date)
+        return jsonify({"fulfillmentText": reply})
+    except:
+        return jsonify({"fulfillmentText": "⚠️ 解析失敗。"})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
